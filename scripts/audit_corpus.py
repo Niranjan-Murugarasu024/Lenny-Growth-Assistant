@@ -122,8 +122,10 @@ def parse_transcript(
 
     try:
         source_path = path.relative_to(archive_root).as_posix()
-    except ValueError:
-        source_path = path.as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"Transcript path '{path}' is outside archive root '{archive_root}'"
+        ) from exc
 
     try:
         raw_bytes = path.read_bytes()
@@ -144,6 +146,7 @@ def parse_transcript(
             "empty_body": True,
             "potential_timestamp_matches": 0,
             "source_sha256": "",
+            "body_sha256": "",
         }
 
     raw_text = raw_bytes.decode(
@@ -199,6 +202,14 @@ def parse_transcript(
         TIMESTAMP_PATTERN.findall(body)
     )
 
+    normalized_body = "\n".join(
+        line.rstrip()
+        for line in body.splitlines()
+    ).strip()
+    body_sha256 = hashlib.sha256(
+        normalized_body.encode("utf-8")
+    ).hexdigest()
+
     return {
         "source_path": source_path,
         "guest": display_value(metadata.get("guest")),
@@ -223,6 +234,7 @@ def parse_transcript(
         "source_sha256": hashlib.sha256(
             raw_bytes
         ).hexdigest(),
+        "body_sha256": body_sha256,
     }
 
 
@@ -245,6 +257,13 @@ def build_manifest(
             f"Episode directory not found: {episodes_dir}"
         )
 
+    try:
+        episodes_dir.relative_to(archive_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Episodes directory '{episodes_dir}' must be inside archive root '{archive_root}'"
+        ) from exc
+
     transcript_paths = sorted(
         episodes_dir.rglob("transcript.md")
     )
@@ -260,19 +279,33 @@ def build_manifest(
         for path in transcript_paths
     ]
 
-    paths_by_hash: dict[str, list[str]] = defaultdict(list)
+    paths_by_source_hash: dict[str, list[str]] = defaultdict(list)
+    paths_by_body_hash: dict[str, list[str]] = defaultdict(list)
 
     for record in records:
-        paths_by_hash[
+        paths_by_source_hash[
             record["source_sha256"]
         ].append(record["source_path"])
+        if record["body_sha256"]:
+            paths_by_body_hash[
+                record["body_sha256"]
+            ].append(record["source_path"])
 
-    duplicate_groups = [
+    duplicate_source_file_groups = [
         {
             "source_sha256": digest,
             "source_paths": sorted(paths),
         }
-        for digest, paths in sorted(paths_by_hash.items())
+        for digest, paths in sorted(paths_by_source_hash.items())
+        if len(paths) > 1
+    ]
+
+    duplicate_dialogue_groups = [
+        {
+            "body_sha256": digest,
+            "source_paths": sorted(paths),
+        }
+        for digest, paths in sorted(paths_by_body_hash.items())
         if len(paths) > 1
     ]
 
@@ -302,8 +335,11 @@ def build_manifest(
             record["potential_timestamp_matches"] > 0
             for record in records
         ),
-        "unique_source_hashes": len(paths_by_hash),
-        "duplicate_content_groups": len(duplicate_groups),
+        "unique_source_hashes": len(paths_by_source_hash),
+        "unique_dialogue_hashes": len(paths_by_body_hash),
+        "duplicate_source_file_groups": len(duplicate_source_file_groups),
+        "duplicate_dialogue_groups": len(duplicate_dialogue_groups),
+        "duplicate_content_groups": len(duplicate_dialogue_groups),
     }
 
     return {
@@ -313,7 +349,9 @@ def build_manifest(
             timezone.utc
         ).isoformat(),
         "summary": summary,
-        "duplicate_groups": duplicate_groups,
+        "duplicate_source_file_groups": duplicate_source_file_groups,
+        "duplicate_dialogue_groups": duplicate_dialogue_groups,
+        "duplicate_groups": duplicate_source_file_groups,
         "episodes": records,
     }
 

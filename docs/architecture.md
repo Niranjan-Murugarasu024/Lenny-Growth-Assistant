@@ -33,9 +33,21 @@ The application will consist of a React frontend, a FastAPI backend, PostgreSQL 
 
 - Discover transcript files.
 - Parse YAML frontmatter.
-- Preserve source hashes and paths.
+- Preserve source hashes (`source_sha256` and `body_sha256`) and paths.
 - Clean and chunk content.
 - Generate embeddings and write records to PostgreSQL.
+
+#### Schema & Ingestion Principles (Task 2 Readiness)
+
+Audit findings dictate the following schema and ingestion rules:
+- **Internal episode ID**: Generate a surrogate primary key independent of external IDs.
+- **Transcript source path**: Required and traceable relative path.
+- **Source platform**: Explicit enum/string (e.g. YouTube, Spotify) allowing non-YouTube episodes.
+- **Source URL**: Nullable or represented in a separate source-links table.
+- **YouTube video ID**: Nullable; no unique constraint on `video_id` (due to 31 upstream collisions and attribution errors).
+- **Publication date**: Nullable when unavailable.
+- **Source-file hash**: Retain for file integrity and change detection.
+- **Dialogue-body hash**: Use to detect duplicated dialogue (6 identified pairs) without premature deletion.
 
 ### Model Configuration
 

@@ -80,6 +80,7 @@ At 00:01:20 the guest discusses product strategy.
     assert record["empty_body"] is False
     assert record["potential_timestamp_matches"] >= 1
     assert len(record["source_sha256"]) == 64
+    assert len(record["body_sha256"]) == 64
     assert record["source_path"] == "episodes/example-guest/transcript.md"
     assert record["metadata"]["keywords"] == ["growth", "pm"]
 
@@ -408,10 +409,15 @@ Unique dialogue (00:02:00).
     assert manifest["schema_version"] == 1
     assert manifest["summary"]["episode_files"] == 3
     assert manifest["summary"]["unique_source_hashes"] == 2
+    assert manifest["summary"]["unique_dialogue_hashes"] == 2
+    assert manifest["summary"]["duplicate_source_file_groups"] == 1
+    assert manifest["summary"]["duplicate_dialogue_groups"] == 1
     assert manifest["summary"]["duplicate_content_groups"] == 1
 
+    assert len(manifest["duplicate_source_file_groups"]) == 1
+    assert len(manifest["duplicate_dialogue_groups"]) == 1
     assert len(manifest["duplicate_groups"]) == 1
-    dup_group = manifest["duplicate_groups"][0]
+    dup_group = manifest["duplicate_source_file_groups"][0]
     assert dup_group["source_paths"] == [
         "episodes/ep1/transcript.md",
         "episodes/ep2/transcript.md",
@@ -421,6 +427,95 @@ Unique dialogue (00:02:00).
     for ep in manifest["episodes"]:
         assert "\\" not in ep["source_path"]
         assert not ep["source_path"].startswith("/")
+
+
+def test_different_metadata_identical_dialogue_identified_as_duplicate(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    episodes_dir = archive_root / "episodes"
+
+    # Different metadata (guests, titles, urls, keywords)
+    content1 = """---
+guest: Guest Alpha
+title: Alpha Title
+youtube_url: https://yt/alpha
+video_id: alpha
+publish_date: 2025-01-01
+keywords:
+  - product
+---
+Lenny (00:00:00): Welcome to the show.
+Guest (00:00:10): Glad to be here discussing growth loops.
+"""
+    content2 = """---
+guest: Guest Beta
+title: Beta Title
+youtube_url: https://yt/beta
+video_id: beta
+publish_date: 2025-02-01
+keywords:
+  - growth
+  - marketing
+---
+Lenny (00:00:00): Welcome to the show.
+Guest (00:00:10): Glad to be here discussing growth loops.
+"""
+
+    (episodes_dir / "ep_alpha").mkdir(parents=True)
+    (episodes_dir / "ep_alpha" / "transcript.md").write_text(content1, encoding="utf-8")
+
+    (episodes_dir / "ep_beta").mkdir(parents=True)
+    (episodes_dir / "ep_beta" / "transcript.md").write_text(content2, encoding="utf-8")
+
+    manifest = build_manifest(archive_root, episodes_dir)
+
+    # Whole-file hashes are distinct because frontmatters differ
+    assert manifest["summary"]["unique_source_hashes"] == 2
+    assert manifest["summary"]["duplicate_source_file_groups"] == 0
+    assert len(manifest["duplicate_source_file_groups"]) == 0
+
+    # Normalized dialogue body hashes are identical
+    assert manifest["summary"]["unique_dialogue_hashes"] == 1
+    assert manifest["summary"]["duplicate_dialogue_groups"] == 1
+    assert len(manifest["duplicate_dialogue_groups"]) == 1
+
+    dup_dialogue = manifest["duplicate_dialogue_groups"][0]
+    assert dup_dialogue["source_paths"] == [
+        "episodes/ep_alpha/transcript.md",
+        "episodes/ep_beta/transcript.md",
+    ]
+
+
+def test_parse_transcript_rejects_path_outside_archive_root(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    archive_root.mkdir()
+
+    outside_file = tmp_path / "external" / "transcript.md"
+    outside_file.parent.mkdir()
+    outside_file.write_text("---\nguest: Outside\n---\nHello", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside archive root"):
+        parse_transcript(outside_file, archive_root)
+
+
+def test_build_manifest_rejects_episodes_dir_outside_archive_root(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    archive_root.mkdir()
+
+    outside_episodes = tmp_path / "other_episodes"
+    outside_episodes.mkdir()
+    (outside_episodes / "ep1").mkdir()
+    (outside_episodes / "ep1" / "transcript.md").write_text(
+        "---\nguest: Outside\n---\nHello", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="must be inside archive root"):
+        build_manifest(archive_root, outside_episodes)
 
 
 def test_build_manifest_missing_directories(
