@@ -31,3 +31,7 @@ pgdata/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local development-agent tooling
+.agents/
+.impeccable/

@@ -1,77 +1,122 @@
-# Architecture — The Lenny Growth Assistant
+# System Architecture & Technical Specifications — The Lenny Growth Assistant
 
-## 1. Intended Architecture
+**Document:** `architecture.md`  
+**Application:** The Lenny Growth Assistant  
+**Architecture Style:** Microservices & Modular Monolith via Docker Compose  
 
-The application will consist of a React frontend, a FastAPI backend, PostgreSQL with pgvector, an application-controlled agent/tool layer, and configurable local and cloud inference providers.
+---
 
-## 2. Component Responsibilities
+## 1. High-Level Architectural Topology
 
-### Frontend
+```
+                                  +---------------------------------------+
+                                  |            Client Browser             |
+                                  |     React 19 + TypeScript (Vite)      |
+                                  +-------------------+-------------------+
+                                                      |
+                                                      | HTTP / Reverse Proxy (:5173 / :80)
+                                                      v
+                                  +---------------------------------------+
+                                  |           Nginx / Vite Proxy          |
+                                  +-------------------+-------------------+
+                                                      |
+                                       +--------------+---------------+
+                                       | /api/*                       | /pi-agent/*
+                                       v                              v
++------------------------------------------+    HTTP RPC    +------------------------------------------+
+|            FastAPI API Server            |<-------------->|          Pi Coding Agent Service         |
+|  - Auth & Authoritative Settings         | (internal tool |  - Express.js + TypeScript               |
+|  - Direct Conversational RAG Engine      |  callbacks)    |  - Multi-turn ReAct Loop                 |
+|  - Writing Studio Job Dispatcher         |                |  - Tools: search_transcripts, context    |
+|  - HTML Sanitization & Version API       |                +------------------------------------------+
++-------------------+----------------------+
+                    |
+          +---------+---------+
+          |                   |
+          v                   v
++-------------------+   +--------------------+
+|   PostgreSQL 17   |   |   Redis 7 Alpine   |
+|   + pgvector      |   |   - Durable Queue  |
+| - 303 episodes    |   |   - Job Pub/Sub    |
+| - 17,365 chunks   |   +---------+----------+
+| - 768-dim vectors |             |
+| - Writing Jobs    |             | BRPOP
+| - Artifacts & vN  |             v
+| - App Settings    |   +------------------------------------------+
++-------------------+   |          Writing Background Worker       |
+                        |  - Standalone Python Process             |
+                        |  - Durable Job Polling & Concurrency (2) |
+                        |  - Heartbeat & Stale Job Recovery        |
+                        |  - 4-Stage Research & Drafting Pipeline  |
+                        |  - Mandatory Quality Evaluation Gate     |
+                        +--------------------+---------------------+
+                                             |
+                         +-------------------+-------------------+
+                         |                                       |
+                         v                                       v
+        +---------------------------------+     +---------------------------------+
+        |          Local Ollama           |     |         NVIDIA NIM Cloud        |
+        |  - Chat: qwen2.5:1.5b           |     |  - Model: openai/gpt-oss-20b    |
+        |  - Embed: nomic-embed-text:v1.5 |     |  - Endpoint: api.nvidia.com/v1  |
+        +---------------------------------+     +---------------------------------+
+```
 
-- Conversational chat interface.
-- Independent chat sessions.
-- Model/provider selection.
-- Source citations and transcript references.
-- Markdown and HTML/CSS artifact viewer.
+---
 
-### FastAPI Backend
+## 2. Core Subsystems & Boundaries
 
-- Validate incoming API requests.
-- Manage session and message persistence.
-- Coordinate retrieval, the selected model, and application skills.
-- Expose health endpoints and structured errors.
-- Enforce source and artifact-rendering policies.
+### 2.1 Storage & Vector Engine (PostgreSQL + pgvector)
+- **Database Engine:** PostgreSQL 17 with `pgvector` v0.8.7.
+- **Key Tables:**
+  - `episodes`: Stores 303 transcribed podcast episodes, metadata, guest details, and YouTube IDs (non-unique constraint to accommodate multi-part uploads).
+  - `transcript_chunks`: 17,365 text chunks with 768-dimensional vector embeddings, start/end timestamps, and foreign keys to `episodes`.
+  - `chat_sessions` & `chat_messages`: Multi-turn conversational history with session isolation.
+  - `writing_artifacts` & `writing_artifact_versions`: Immutable document versioning tree with Markdown and rendered HTML.
+  - `writing_jobs`: Background job tracking with status (`queued`, `running`, `completed`, `failed`), heartbeats, and retry counters.
+  - `app_settings`: Authoritative runtime model configuration (`active_provider`, `chat_model`, `embedding_model`).
 
-### PostgreSQL and pgvector
+### 2.2 Dual Orchestration Subsystem
+1. **Direct Conversational RAG Engine (FastAPI):**
+   - Sub-second conversational responses.
+   - Embeds query using `nomic-embed-text:v1.5`, queries cosine distance against `transcript_chunks`, suppresses duplicates across identical episodes, and synthesizes answers with strict citation formatting.
+2. **Autonomous Pi Coding Agent (Node.js/Express):**
+   - Autonomous ReAct agent utilizing tool-calling loops.
+   - Communicates back to FastAPI internal endpoints (`/api/v1/internal/retrieval/search`) using shared internal tokens.
+   - Executes multi-step investigative search and transcript context inspection.
 
-- Store episode metadata and transcript chunks.
-- Store chunk embeddings and provenance.
-- Persist sessions and conversations.
-- Store generated artifacts and their session references.
+### 2.3 Durable Writing Background Worker Subsystem
+- **Queue Coordination:** Primary queue via Redis list `lenny:writing:jobs` using `BRPOP`; automatic fallback to PostgreSQL polling (`status = 'queued'`) if Redis is unreachable.
+- **Crash Recovery:** Worker startup initiates `recover_stale_jobs()` which scans for jobs abandoned in `running` status without recent heartbeats.
+- **Snapshot Integrity:** Jobs snapshot the active provider and model at queue time without injecting execution fields into the validated user brief (`unpack_job_brief()`).
+- **Ship 30 for 30 Pipeline:**
+  1. `Research`: Multi-query semantic retrieval collecting grounded evidence chunks.
+  2. `Drafting`: Prompt engineering enforcing Nicolas Cole & Dickie Bush Ship 30 for 30 structures (Hook, Thesis, Framework, Takeaway).
+  3. `Quality Gate`: Deterministic checks measuring body word count tolerance, section presence, and citation integrity.
+  4. `Bounded Revision`: If quality checks fail, a targeted length and structural correction is executed once. If still out-of-range, the draft is persisted and flagged with diagnostic metadata.
+  5. `Persistence`: Writing artifact and initial immutable version created in PostgreSQL.
 
-### Transcript Ingestion
+### 2.4 Asynchronous AI Revision Subsystem
+- Revisions requested in the Artifact Viewer are submitted as non-blocking background jobs returning HTTP 202 with `job_id`.
+- The worker executes the revision, verifies that the artifact version has not been concurrently mutated by the user, and commits the result as a new incremented version `vN`.
+- The frontend polls the job until completion, avoiding HTTP client timeouts.
 
-- Discover transcript files.
-- Parse YAML frontmatter.
-- Preserve source hashes (`source_sha256` and `body_sha256`) and paths.
-- Clean and chunk content.
-- Generate embeddings and write records to PostgreSQL.
+---
 
-#### Schema & Ingestion Principles (Task 2 Readiness)
+## 3. Security & Sandboxing Architecture
 
-Audit findings dictate the following schema and ingestion rules:
-- **Internal episode ID**: Generate a surrogate primary key independent of external IDs.
-- **Transcript source path**: Required and traceable relative path.
-- **Source platform**: Explicit enum/string (e.g. YouTube, Spotify) allowing non-YouTube episodes.
-- **Source URL**: Nullable or represented in a separate source-links table.
-- **YouTube video ID**: Nullable; no unique constraint on `video_id` (due to 31 upstream collisions and attribution errors).
-- **Publication date**: Nullable when unavailable.
-- **Source-file hash**: Retain for file integrity and change detection.
-- **Dialogue-body hash**: Use to detect duplicated dialogue (6 identified pairs) without premature deletion.
+1. **HTML Preview Isolation:**
+   - Server-side sanitization with `nh3` removes script tags, event handlers, and dangerous iframe attributes.
+   - Client-side iframe rendering uses a restrictive sandbox (`sandbox=""` with no `allow-scripts` or `allow-same-origin`).
+2. **Secret Governance:**
+   - Server-side environment variables manage API keys (e.g. `NVIDIA_API_KEY`).
+   - Secrets are excluded from client bundles, logs, and Git tracking.
+3. **Citation Provenance:**
+   - All citations displayed to the user must resolve to actual database `chunk_id` records. Hallucinated chunk IDs are rejected during evaluation.
 
-### Model Configuration
+---
 
-- Support Ollama for the mandatory local demonstration.
-- Support a verified cloud-model path through a configuration layer.
-- Keep embedding-model configuration independent of the chat model.
-- Handle provider failures and timeouts explicitly.
+## 4. Multi-Model Runtime Switching
 
-### Skills and Tools
-
-- Transcript retrieval and grounded Q&A.
-- Ship 30 for 30-style essay generation.
-- Markdown and HTML/CSS artifact creation.
-
-## 3. Current Milestone
-
-Task 1 establishes the repository, audits the transcript source, and records corpus metadata in a generated manifest.
-
-No vector database, embeddings, FastAPI endpoints, agents, or frontend features are implemented in this milestone.
-
-## 4. Initial Security Principles
-
-- Do not commit secrets or raw transcript files.
-- Validate all incoming API requests.
-- Only expose explicitly authorized application tools to the agent.
-- Treat generated HTML as untrusted content and isolate its rendering.
-- Validate citations against stored source records.
+- **Local Inference:** Ollama HTTP API (`http://host.docker.internal:11434`), running `qwen2.5:1.5b` for chat and `nomic-embed-text:v1.5` for vector embeddings.
+- **Cloud Inference:** NVIDIA NIM OpenAI-compatible Chat Completions API (`https://integrate.api.nvidia.com/v1`), running `openai/gpt-oss-20b`.
+- **Authoritative Synchronization:** Selecting a provider in the frontend updates the database settings table. Subsequent chat requests and background jobs inherit the selected provider snapshot.

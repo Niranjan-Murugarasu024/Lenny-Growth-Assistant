@@ -1,0 +1,160 @@
+# Production Docker Compose Configuration
+# Use with: docker compose -f compose.yaml -f compose.prod.yaml up -d
+# Or standalone: docker compose -f compose.prod.yaml up -d
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in production environment}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in production environment}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in production environment}
+    # No host port published in production; accessible only via internal network
+    ports: []
+    volumes:
+      - lenny_growth_pgdata:/var/lib/postgresql/data
+    networks:
+      - internal-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    # No host port published in production
+    ports: []
+    volumes:
+      - lenny_growth_redisdata:/data
+    networks:
+      - internal-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      # In production, bind only to loopback for reverse-proxy (Nginx / Caddy / Traefik)
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CHAT_PROVIDER: ${CHAT_PROVIDER:-litellm}
+      LITELLM_MODEL: ${LITELLM_MODEL:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      LITELLM_API_BASE: ${LITELLM_API_BASE:-}
+      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-openai/gpt-oss-20b}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_TIMEOUT_SECONDS: ${NVIDIA_TIMEOUT_SECONDS:-120.0}
+      CHAT_TIMEOUT_SECONDS: ${CHAT_TIMEOUT_SECONDS:-180.0}
+      WRITING_TIMEOUT_SECONDS: ${WRITING_TIMEOUT_SECONDS:-360.0}
+      CHAT_ORCHESTRATOR: ${CHAT_ORCHESTRATOR:-rag}
+      PI_AGENT_HOST: pi-agent
+      PI_AGENT_PORT: 3000
+      PI_AGENT_REQUEST_TIMEOUT_SECONDS: ${PI_AGENT_REQUEST_TIMEOUT_SECONDS:-180.0}
+      AGENT_INTERNAL_TOKEN: ${AGENT_INTERNAL_TOKEN:?Set AGENT_INTERNAL_TOKEN in production environment}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal-net
+      - ingress-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "backend.app.writing.worker"]
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CHAT_PROVIDER: ${CHAT_PROVIDER:-litellm}
+      LITELLM_MODEL: ${LITELLM_MODEL:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      LITELLM_API_BASE: ${LITELLM_API_BASE:-}
+      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-openai/gpt-oss-20b}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_TIMEOUT_SECONDS: ${NVIDIA_TIMEOUT_SECONDS:-180.0}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      RETRIEVAL_MODE: ${RETRIEVAL_MODE:-hybrid}
+      CHAT_TIMEOUT_SECONDS: ${CHAT_TIMEOUT_SECONDS:-360.0}
+      WRITING_TIMEOUT_SECONDS: ${WRITING_TIMEOUT_SECONDS:-360.0}
+      WORKER_JOB_TIMEOUT_SECONDS: ${WORKER_JOB_TIMEOUT_SECONDS:-480.0}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal-net
+
+  pi-agent:
+    build:
+      context: ./agent-service
+      dockerfile: Dockerfile
+    restart: always
+    # No host port published in production; internal communication only
+    ports: []
+    environment:
+      PORT: 3000
+      HOST: 0.0.0.0
+      INTERNAL_TOKEN: ${AGENT_INTERNAL_TOKEN:?Set AGENT_INTERNAL_TOKEN in production environment}
+      AGENT_INTERNAL_TOKEN: ${AGENT_INTERNAL_TOKEN:?Set AGENT_INTERNAL_TOKEN in production environment}
+      BACKEND_URL: http://api:8000
+      BACKEND_BASE_URL: http://api:8000
+      MODEL_PROVIDER: ${PI_AGENT_MODEL_PROVIDER:-openai}
+      MODEL_ID: ${PI_AGENT_MODEL_ID:-gpt-4o-mini}
+      MODEL_BASE_URL: ${PI_AGENT_MODEL_BASE_URL:-}
+      PI_AGENT_MODEL_API_KEY: ${PI_AGENT_MODEL_API_KEY:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - ingress-net
+
+networks:
+  internal-net:
+    driver: bridge
+    internal: true
+  ingress-net:
+    driver: bridge
+
+volumes:
+  lenny_growth_pgdata:
+  lenny_growth_redisdata:

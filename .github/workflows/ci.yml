@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-backend:
+    name: Python Backend Tests & Migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg17-trixie
+        env:
+          POSTGRES_DB: lenny_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d lenny_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Verify database migration on clean database
+        env:
+          DATABASE_URL: postgresql+psycopg://test_user:test_password@localhost:5432/lenny_test
+        run: |
+          alembic upgrade head
+
+      - name: Run Python test suite
+        env:
+          DATABASE_URL: postgresql+psycopg://test_user:test_password@localhost:5432/lenny_test
+          REDIS_URL: redis://localhost:6379/0
+          POSTGRES_DB: lenny_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          CHAT_PROVIDER: ollama
+          OLLAMA_BASE_URL: http://localhost:11434
+        run: |
+          python -m pytest
+
+  frontend:
+    name: Frontend Build & Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run frontend unit tests
+        run: npm test
+
+      - name: Build frontend production bundle
+        run: npm run build
+
+  agent-service:
+    name: Pi Agent Service Build & Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-service
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: agent-service/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Pi agent tests
+        run: npm test
+
+      - name: Compile TypeScript
+        run: npm run build
+
+  container-validation:
+    name: Container Configuration & Image Builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose Configuration
+        run: docker compose config
+
+      - name: Build Application Images
+        run: docker compose build

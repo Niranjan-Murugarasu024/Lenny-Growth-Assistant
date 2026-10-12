@@ -1,0 +1,151 @@
+services:
+  db:
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - lenny_growth_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - lenny_growth_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: ${OLLAMA_CONTAINER_BASE_URL:-http://host.docker.internal:11434}
+      CHAT_PROVIDER: ${CHAT_PROVIDER:-ollama}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:1.5b}
+      LITELLM_MODEL: ${LITELLM_MODEL:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      LITELLM_API_BASE: ${LITELLM_API_BASE:-}
+      LITELLM_TIMEOUT_SECONDS: ${LITELLM_TIMEOUT_SECONDS:-240.0}
+      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-openai/gpt-oss-20b}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_TIMEOUT_SECONDS: ${NVIDIA_TIMEOUT_SECONDS:-120.0}
+      CHAT_TIMEOUT_SECONDS: ${CHAT_TIMEOUT_SECONDS:-240.0}
+      CHAT_ORCHESTRATOR: ${CHAT_ORCHESTRATOR:-rag}
+      PI_AGENT_HOST: pi-agent
+      PI_AGENT_PORT: 3000
+      PI_AGENT_REQUEST_TIMEOUT_SECONDS: ${PI_AGENT_REQUEST_TIMEOUT_SECONDS:-300.0}
+      AGENT_INTERNAL_TOKEN: ${AGENT_INTERNAL_TOKEN:-lenny-agent-internal-secret-token}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "backend.app.writing.worker"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: ${OLLAMA_CONTAINER_BASE_URL:-http://host.docker.internal:11434}
+      CHAT_PROVIDER: ${CHAT_PROVIDER:-ollama}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:1.5b}
+      LITELLM_MODEL: ${LITELLM_MODEL:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      LITELLM_API_BASE: ${LITELLM_API_BASE:-}
+      LITELLM_TIMEOUT_SECONDS: ${LITELLM_TIMEOUT_SECONDS:-360.0}
+      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-openai/gpt-oss-20b}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_TIMEOUT_SECONDS: ${NVIDIA_TIMEOUT_SECONDS:-180.0}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      RETRIEVAL_MODE: ${RETRIEVAL_MODE:-hybrid}
+      CHAT_TIMEOUT_SECONDS: ${CHAT_TIMEOUT_SECONDS:-360.0}
+      WRITING_TIMEOUT_SECONDS: ${WRITING_TIMEOUT_SECONDS:-360.0}
+      WORKER_JOB_TIMEOUT_SECONDS: ${WORKER_JOB_TIMEOUT_SECONDS:-480.0}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  pi-agent:
+    build:
+      context: ./agent-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      PORT: 3000
+      HOST: 0.0.0.0
+      INTERNAL_TOKEN: ${AGENT_INTERNAL_TOKEN:-lenny-agent-internal-secret-token}
+      AGENT_INTERNAL_TOKEN: ${AGENT_INTERNAL_TOKEN:-lenny-agent-internal-secret-token}
+      BACKEND_URL: http://api:8000
+      BACKEND_BASE_URL: http://api:8000
+      MODEL_PROVIDER: ${PI_AGENT_MODEL_PROVIDER:-ollama}
+      MODEL_ID: ${PI_AGENT_MODEL_ID:-qwen2.5:1.5b}
+      MODEL_BASE_URL: ${PI_AGENT_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      MODEL_API_KEY: ${PI_AGENT_MODEL_API_KEY:-}
+      PI_AGENT_MODEL_PROVIDER: ${PI_AGENT_MODEL_PROVIDER:-ollama}
+      PI_AGENT_MODEL_ID: ${PI_AGENT_MODEL_ID:-qwen2.5:1.5b}
+      PI_AGENT_MODEL_BASE_URL: ${PI_AGENT_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      PI_AGENT_MODEL_API_KEY: ${PI_AGENT_MODEL_API_KEY:-}
+      OPENAI_API_KEY: ${PI_AGENT_MODEL_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      - api
+
+volumes:
+  lenny_growth_pgdata:
+  lenny_growth_redisdata:
